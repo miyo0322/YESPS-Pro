@@ -257,7 +257,9 @@ const sheet = document.getElementById('sheet');
 function toggleSheet() {
   if (window.innerWidth >= 768) return; // Mac/iPad 固定左侧
   sheetState = sheetState === 's-mini' ? 's-half' : 's-mini';
-  sheet.className = sheetState;
+  // 用 classList 切换，保留 #sheet 上的其他样式类
+  sheet.classList.toggle('s-mini', sheetState === 's-mini');
+  sheet.classList.toggle('s-half', sheetState === 's-half');
 }
 
 function buildList() {
@@ -265,12 +267,19 @@ function buildList() {
   QUAKES.forEach(q => {
     const d = document.createElement('div'); d.className='card';
     const c = q.mag>=9 ? 'm-ex' : q.mag>=8 ? 'm-hg' : '';
-    d.innerHTML = `<div class="c-mag ${c}">${q.mag.toFixed(1)}</div><div class="c-info"><h4>${q.n}</h4><p>Coordinates: ${q.lat}°N, ${q.lon}°E</p></div>`;
+    d.innerHTML = `<div class="c-mag ${c}">${q.mag.toFixed(1)}</div><div class="c-info"><h4>${q.n}</h4><p>Coordinates: ${fmtLat(q.lat)}, ${fmtLon(q.lon)}</p></div>`;
     d.onclick = () => startSim(q, d); list.appendChild(d);
   });
 }
 
-let aq = null, running = false, simTime = 0, lastTime = 0, trig = {};
+let aq = null, running = false, simTime = 0, lastTime = 0, trig = {}, done = false;
+
+// 像素/公里比：取纬线方向，与等距圆柱投影的水平比例一致（赤道上一度经度 ≈ 111.32km）
+function kmToPx() { return lW / (360 * 111.32); }
+
+// 半球格式化：南纬/西经显示为 S / W，而不是负号
+function fmtLat(lat) { return `${Math.abs(lat).toFixed(3)}°${lat >= 0 ? 'N' : 'S'}`; }
+function fmtLon(lon) { return `${Math.abs(lon).toFixed(3)}°${lon >= 0 ? 'E' : 'W'}`; }
 
 function log(t, msg) {
   const logBox = document.getElementById('logs');
@@ -279,13 +288,19 @@ function log(t, msg) {
 }
 
 function startSim(q, el) {
-  aq = q; running = true; simTime = 0; lastTime = performance.now(); trig = {};
+  aq = q; running = true; done = false; simTime = 0; lastTime = performance.now(); trig = {};
   document.querySelectorAll('.card').forEach(c => c.classList.remove('act')); el.classList.add('act');
   
   // 交互反馈：选定目标后自动收起抽屉，展示完整地图和数据面板
-  if (window.innerWidth < 768) { sheetState = 's-mini'; sheet.className = 's-mini'; }
+  if (window.innerWidth < 768) { sheetState = 's-mini'; sheet.classList.remove('s-open','s-half'); sheet.classList.add('s-mini'); }
   document.getElementById('widgets').classList.add('show');
   document.getElementById('logs').innerHTML = '';
+
+  // 重置上一场残留的状态显示，否则新一场会从上一场的公里数接着读
+  const wp = document.getElementById('w-p'), ws = document.getElementById('w-s');
+  wp.textContent = 'Wait'; wp.style.color = 'var(--text-sec)';
+  ws.textContent = 'Wait'; ws.style.color = 'var(--text-sec)';
+  document.getElementById('w-timer').textContent = '00.00';
   
   log('info', `Target Locked: Depth ${q.dep}km.`);
 }
@@ -302,33 +317,42 @@ function raf(now) {
   
   // 2. 物理波动解算
   if(aq && running) {
-    simTime += Math.min(dt, 0.1); const t = simTime;
+    // dt 限幅：切后台回来 / 首帧不会跳变
+    simTime += Math.min(Math.max(dt, 0), 0.1); const t = simTime;
     const {x:cx, y:cy} = ll2xy(aq.lat, aq.lon, lW, lH);
-    const pkm = lW / (360 * 111.32); // 像素/公里比
-    
+    const pkm = kmToPx();
+    const wp = document.getElementById('w-p'), ws = document.getElementById('w-s');
+
+    const sArrive = aq.dep / aq.s;              // S 波从震源到地表的到达时间(s)
+    const rP = Math.max(t * aq.p, 0);           // P 波传播距离(km)，p 单位是 km/s
+    const rS = Math.max((t - sArrive) * aq.s, 0);
+
     document.getElementById('w-timer').textContent = t < 10 ? `0${t.toFixed(2)}` : t.toFixed(2);
-    
-    // P-Wave (Primary, Fast, Non-destructive)
-    if(t <= 180) {
-      const rp = t * aq.p * 60 * pkm;
-      mCtx.strokeStyle = 'rgba(0, 216, 255, 0.9)'; mCtx.lineWidth = 1.5; mCtx.setLineDash([6,6]);
-      mCtx.beginPath(); mCtx.arc(cx,cy,rp,0,Math.PI*2); mCtx.stroke(); mCtx.setLineDash([]);
-      document.getElementById('w-p').textContent = 'Expanding'; document.getElementById('w-p').style.color = 'var(--p-wave)';
-    }
-    
+
+    // P-Wave (Primary, Fast, Non-destructive) —— 波前达到对跖点后停止扩张，只保留痕迹
+    const rPKm = Math.min(rP, 20015);
+    const rp = rPKm * pkm;
+    mCtx.strokeStyle = rP <= 20015 ? 'rgba(0, 216, 255, 0.9)' : 'rgba(0, 216, 255, 0.35)';
+    mCtx.lineWidth = 1.5; mCtx.setLineDash([6,6]);
+    mCtx.beginPath(); mCtx.arc(cx,cy,rp,0,Math.PI*2); mCtx.stroke(); mCtx.setLineDash([]);
+    if (rP <= 20015) { wp.textContent = `${rP.toFixed(0)} km`; wp.style.color = 'var(--p-wave)'; }
+
     // S-Wave (Secondary, Slower, Highly Destructive)
-    const ss = aq.dep / (aq.s * 60); // S波抵达地表的时间
-    if(t >= ss) {
-      const rs = (t-ss) * aq.s * 60 * pkm;
+    if (t >= sArrive) {
+      const rSKm = Math.min(rS, 20015);
+      const rs = rSKm * pkm;
       mCtx.strokeStyle = '#ff3b30'; mCtx.lineWidth = 2.5;
       mCtx.beginPath(); mCtx.arc(cx,cy,rs,0,Math.PI*2); mCtx.stroke();
-      
-      // 内层能量场渐变
-      const grd = mCtx.createRadialGradient(cx,cy,0, cx,cy,rs);
-      grd.addColorStop(0, 'rgba(255, 59, 48, 0)'); grd.addColorStop(1, 'rgba(255, 59, 48, 0.25)');
-      mCtx.fillStyle = grd; mCtx.fill();
-      
-      document.getElementById('w-s').textContent = `${((t-ss)*aq.s*60).toFixed(0)} km`; document.getElementById('w-s').style.color = 'var(--s-wave)';
+
+      // 内层能量场：必须重新 beginPath，否则 fill 会重填上一条 P 波路径
+      if (rs > 1) {
+        const grd = mCtx.createRadialGradient(cx,cy,Math.max(rs - 40, 0), cx,cy,rs);
+        grd.addColorStop(0, 'rgba(255, 59, 48, 0)'); grd.addColorStop(1, 'rgba(255, 59, 48, 0.18)');
+        mCtx.beginPath(); mCtx.arc(cx,cy,rs,0,Math.PI*2);
+        mCtx.fillStyle = grd; mCtx.fill();
+      }
+
+      ws.textContent = `${rS.toFixed(0)} km`; ws.style.color = 'var(--s-wave)';
     }
     
     // Epicenter Center Dot
@@ -338,8 +362,13 @@ function raf(now) {
     
     // Events Trigger Logic
     if(t>0.2 && !trig.p) { trig.p=1; log('info','P-Wave detected. Early warning active.'); }
-    if(t>ss && !trig.s) { trig.s=1; log('alert','⚠ S-Wave surface rupture! Severe damage expected.'); }
-    if(t > aq.dur) { running = false; log('info', 'Simulation finalized.'); document.getElementById('w-p').style.color='var(--text-sec)'; document.getElementById('w-p').textContent='Done'; }
+    if(t >= sArrive && !trig.s) { trig.s=1; log('alert','⚠ S-Wave surface rupture! Severe damage expected.'); }
+    if(t > aq.dur && !done) {
+      done = true; running = false;
+      log('info', 'Simulation finalized.');
+      wp.style.color = 'var(--text-sec)'; wp.textContent = 'Done';
+      ws.style.color = 'var(--text-sec)'; ws.textContent = 'Done';
+    }
   }
   requestAnimationFrame(raf);
 }
